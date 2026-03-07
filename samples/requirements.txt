@@ -1,0 +1,5 @@
+setuptools
+Cython
+cryptography
+pyinstaller
+dbg
