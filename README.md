@@ -2,7 +2,7 @@
 
 Load `.pyd` (Cython/C-extension) files **directly from memory** on Windows — no temp files, no disk writes.
 
-Built on top of [`pythonmemorymodule`](https://github.com/f0rkd/pythonmemorymodule). Supports both single `.pyd` files and multi-file packages with relative imports (PEP 451 multi-phase init).
+Built on top of [`pythonmemorymodule`](https://github.com/naksyn/pythonmemorymodule). Supports both single `.pyd` files and multi-file packages with relative imports (PEP 451 multi-phase init).
 
 ---
 
