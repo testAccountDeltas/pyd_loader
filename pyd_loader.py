@@ -329,6 +329,7 @@ class PydMemoryLoader:
         self._mem_mod:   Optional[object]           = None
         self._module:    Optional[types.ModuleType] = None
         self._keepalive: list                       = []
+        self._tracker    = _ImportTracker()
 
     # ── Фабричные методы ─────────────────────────────────────────────────────
 
