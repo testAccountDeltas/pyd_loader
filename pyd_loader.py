@@ -32,27 +32,19 @@ import inspect
 import importlib.machinery
 from typing import Optional, Any
 
-
 if os.name != "nt":
     raise RuntimeError("PydMemoryLoader работает только на Windows (.pyd — это DLL)")
-
-try:
-    import pythonmemorymodule
-except ImportError as e:
-    raise ImportError("Установи зависимость: pip install pythonmemorymodule") from e
-
-
-
+    
+import pythonmemorymodule
 
 # ── Константы PyModuleDef ─────────────────────────────────────────────────────
 
 _Py_mod_create = 1
 _Py_mod_exec   = 2
-_OFF_M_SLOTS   = 72
-_SLOT_SIZE     = 16  # sizeof(PyModuleDef_Slot)
+_OFF_M_SLOTS   = 72   # offset of m_slots in PyModuleDef (CPython 3.5+)
+_SLOT_SIZE     = 16   # sizeof(PyModuleDef_Slot) — type (int) + value (void*)
 
-
-# ── PE-уровень (через pefile) ─────────────────────────────────────────────────
+# ── PE-уровень (определение имени модуля) ─────────────────────────────────────
 
 def _detect_module_name_from_exports(data: bytes) -> Optional[str]:
     """Ищет PyInit_* в таблице экспортов DLL."""
@@ -68,7 +60,6 @@ def _detect_module_name_from_exports(data: bytes) -> Optional[str]:
         pass
     return None
 
-
 def _get_dll_exports(data: bytes) -> list[str]:
     """Все экспортируемые имена DLL."""
     try:
@@ -83,8 +74,7 @@ def _get_dll_exports(data: bytes) -> list[str]:
         ]
     except Exception:
         return []
-
-
+        
 def _get_dll_imports(data: bytes) -> dict[str, list[str]]:
     """Таблица импортов DLL: {dll_name: [func, ...]}."""
     try:
@@ -106,45 +96,36 @@ def _get_dll_imports(data: bytes) -> dict[str, list[str]]:
     except Exception:
         return {}
 
-
 # ── CPython internals ─────────────────────────────────────────────────────────
+# ── Работа со слотами PyModuleDef ─────────────────────────────────────────────
 
 def _read_moduledef_slots(moduledef_obj) -> tuple[Optional[int], list[int]]:
+    """Читает слоты из PyModuleDef.m_slots по смещению."""
     base = id(moduledef_obj)
     slots_addr = ctypes.c_uint64.from_address(base + _OFF_M_SLOTS).value
     if slots_addr == 0:
         return None, []
+    
     create_fn = None
     exec_fns: list[int] = []
     idx = 0
     while True:
-        s_type = ctypes.c_int32.from_address(slots_addr + idx * _SLOT_SIZE).value
-        s_val  = ctypes.c_uint64.from_address(slots_addr + idx * _SLOT_SIZE + 8).value
+        s_type = ctypes.c_int.from_address(slots_addr + idx * _SLOT_SIZE).value
         if s_type == 0:
             break
+        s_val = ctypes.c_uint64.from_address(slots_addr + idx * _SLOT_SIZE + 8).value
+        
         if s_type == _Py_mod_create:
             create_fn = s_val
         elif s_type == _Py_mod_exec:
             exec_fns.append(s_val)
+        
         idx += 1
     return create_fn, exec_fns
 
 
-def _find_python_dll_proc(name: bytes) -> Optional[int]:
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.GetModuleHandleW.restype  = ctypes.c_void_p
-    kernel32.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
-    kernel32.GetProcAddress.restype    = ctypes.c_void_p
-    kernel32.GetProcAddress.argtypes   = [ctypes.c_void_p, ctypes.c_char_p]
-    py_ver = f"{sys.version_info.major}{sys.version_info.minor}"
-    hmod = kernel32.GetModuleHandleW(f"python{py_ver}.dll")
-    if not hmod:
-        return None
-    return kernel32.GetProcAddress(hmod, name) or None
-
-
 def _incref_all_c_objects(mod) -> None:
-    """Рекурсивный Py_IncRef — предотвращает краш tp_dealloc при финализации."""
+    """Рекурсивный Py_IncRef для предотвращения преждевременного tp_dealloc."""
     api = ctypes.pythonapi
     api.Py_IncRef.argtypes = [ctypes.py_object]
     api.Py_IncRef.restype  = None
@@ -172,7 +153,7 @@ def _incref_all_c_objects(mod) -> None:
             pass
 
 
-# ── Классификация атрибутов ───────────────────────────────────────────────────
+# ── Классификация атрибутов (без изменений) ───────────────────────────────────
 
 def _classify_attr(obj: Any) -> str:
     if inspect.isbuiltin(obj):
@@ -191,6 +172,7 @@ def _classify_attr(obj: Any) -> str:
     if type(obj).__name__ in ("int", "float", "str", "bool", "bytes", "NoneType"):
         return "constant"
     return type(obj).__name__
+
 
 
 # ── Import tracker ────────────────────────────────────────────────────────────
@@ -337,7 +319,7 @@ class PydMemoryLoader:
             detected = _detect_module_name_from_exports(data)
             if not detected:
                 raise ValueError(
-                    "Не удалось определить имя модуля из экспортов DLL. "
+                    "Не удалось определить имя модуля из экспортов. "
                     "Передай module_name= явно или установи pefile."
                 )
             self._module_name = detected
@@ -347,7 +329,6 @@ class PydMemoryLoader:
         self._mem_mod:   Optional[object]           = None
         self._module:    Optional[types.ModuleType] = None
         self._keepalive: list                       = []
-        self._tracker    = _ImportTracker()
 
     # ── Фабричные методы ─────────────────────────────────────────────────────
 
@@ -366,8 +347,6 @@ class PydMemoryLoader:
             basename = os.path.basename(path)
             module_name = basename.split(".")[0] or None
         return cls(data, module_name=module_name, suppress_debug=suppress_debug, **kwargs)
-
-    # ── Загрузка ─────────────────────────────────────────────────────────────
 
     def load(self) -> types.ModuleType:
         """
@@ -392,13 +371,14 @@ class PydMemoryLoader:
             stub.__package__ = package_name
             stub.__path__    = []
             sys.modules[package_name] = stub
-            self._log(f"Заглушка пакета: '{package_name}'")
+            self._log(f"Создан stub-пакет: '{package_name}'")
 
+        # Загружаем DLL в память
         try:
             # pythonmemorymodule имеет модульную переменную debug_output
             # которая перекрывает параметр debug= конструктора.
             # Временно выставляем её в False если нужно подавить вывод.
-            _orig_flag = getattr(pythonmemorymodule, "debug_output", None)
+            orig_debug = getattr(pythonmemorymodule, "debug_output", None)
             if self._suppress_debug:
                 pythonmemorymodule.debug_output = False
             try:
@@ -407,27 +387,28 @@ class PydMemoryLoader:
                     debug=not self._suppress_debug,
                 )
             finally:
-                if _orig_flag is not None:
-                    pythonmemorymodule.debug_output = _orig_flag
+                if orig_debug is not None:
+                    pythonmemorymodule.debug_output = orig_debug
             self._keepalive.append(self._mem_mod)
         except Exception as e:
-            raise RuntimeError(f"MemoryModule: {e}") from e
+            raise RuntimeError(f"MemoryModule загрузка провалилась: {e}") from e
 
         init_func = self._get_init_func(base_name)
 
         try:
             raw = init_func()
-            time.sleep(0.02)
+            time.sleep(0.01)  # небольшой запас на возможные race в C-расширениях
         except Exception as e:
-            raise RuntimeError(f"PyInit_{base_name}(): {e}") from e
+            raise RuntimeError(f"PyInit_{base_name}() → {e}") from e
+
         if raw is None:
             raise RuntimeError(f"PyInit_{base_name}() вернул NULL")
 
         if type(raw).__name__ == "moduledef":
-            self._log("Многофазная инициализация (PEP 451)...")
+            self._log("Многофазная инициализация (PEP 451 / PyModuleDef slots)")
             module = self._init_multiphase(raw, register_name)
         else:
-            self._log("Однофазная инициализация.")
+            self._log("Однофазная инициализация (классический PyModule_Create)")
             module = raw
 
         module.__package__ = package_name
@@ -435,10 +416,10 @@ class PydMemoryLoader:
 
         if self._register:
             sys.modules[register_name] = module
-            self._log(f"sys.modules['{register_name}'] = OK")
+            self._log(f"Зарегистрирован в sys.modules: '{register_name}'")
 
         self._module = module
-        self._log("Загрузка завершена.")
+        self._log("Загрузка завершена успешно.")
         return module
 
     @property
@@ -490,13 +471,12 @@ class PydMemoryLoader:
             sig = doc = ""
             try:
                 sig = str(inspect.signature(obj))
-            except (ValueError, TypeError):
+            except Exception:
                 raw_doc = getattr(obj, "__doc__", "") or ""
                 first = raw_doc.strip().splitlines()[0] if raw_doc.strip() else ""
                 sig = first if "(" in first else ""
             try:
-                lines = (getattr(obj, "__doc__", "") or "").strip().splitlines()
-                doc = lines[0] if lines else ""
+                doc = (getattr(obj, "__doc__", "") or "").strip().splitlines()[0]
             except Exception:
                 pass
             result[name] = {"type": info["type"], "signature": sig, "doc": doc}
@@ -751,24 +731,22 @@ class PydMemoryLoader:
                 print(f"    + {e.name}")
         print()
 
-    # ── Внутренние методы ─────────────────────────────────────────────────────
+    # ── Внутренние вспомогательные методы ─────────────────────────────────────
 
     def _require_loaded(self) -> None:
         if self._module is None:
-            raise RuntimeError("Сначала вызови load()")
+            raise RuntimeError("Модуль ещё не загружен — вызови .load()")
 
     def _log(self, msg: str) -> None:
         if self._verbose:
-            print(f"[PydLoader] {msg}")
+            print(f"[PydMemoryLoader] {msg}")
 
     def _get_init_func(self, base_name: str):
         init_name = f"PyInit_{base_name}"
         try:
             addr = self._mem_mod.get_proc_addr(init_name)
         except Exception as e:
-            raise RuntimeError(
-                f"'{init_name}' не найдена в DLL — проверь имя модуля. {e}"
-            ) from e
+            raise RuntimeError(f"Символ '{init_name}' не найден в DLL: {e}") from e
 
         FuncType = ctypes.PYFUNCTYPE(ctypes.py_object)
         if isinstance(addr, int):
@@ -786,8 +764,6 @@ class PydMemoryLoader:
         create_fn, exec_fns = _read_moduledef_slots(moduledef)
         self._log(f"Слоты: create={'да' if create_fn else 'нет'}, exec={len(exec_fns)}")
 
-        addr_exec = _find_python_dll_proc(b"PyModule_ExecDef")
-
         # spec.parent вычисляется автоматически из name:
         #   "atom.parser" → parent = "atom"
         #   "atom"        → parent = ""
@@ -795,8 +771,8 @@ class PydMemoryLoader:
         # и разрешает relative imports внутри него.
 
         # Является ли этот модуль пакетом?
-        existing    = sys.modules.get(register_name)
-        is_package  = (
+        existing = sys.modules.get(register_name)
+        is_package = (
             # Явно зарегистрирован как пакет
             getattr(existing, "__path__", None) is not None
             # Или это top-level имя без точки (atom, не atom.parser)
@@ -805,69 +781,55 @@ class PydMemoryLoader:
 
         spec = importlib.machinery.ModuleSpec(
             register_name,
-            loader      = None,
-            origin      = f"<memory>/{register_name}",
-            is_package  = is_package,
+            loader=None,
+            origin=f"<memory>/{register_name}",
+            is_package=is_package,
         )
 
         # Если пакет уже в sys.modules с настроенным __path__ — берём его
         if existing is not None:
-            existing_path = getattr(existing, "__path__", None)
-            if existing_path is not None:
-                spec.submodule_search_locations = list(existing_path)
+            p = getattr(existing, "__path__", None)
+            if p is not None:
+                spec.submodule_search_locations = list(p)
 
         self._keepalive.append(spec)
 
+        # 1. Выполняем Py_mod_create если есть
         if create_fn:
-            _FT = ctypes.PYFUNCTYPE(ctypes.py_object, ctypes.py_object, ctypes.py_object)
-            _fn = _FT(create_fn)
-            self._keepalive.extend([_FT, _fn])
-            module = _fn(spec, moduledef)
+            CreateFT = ctypes.PYFUNCTYPE(ctypes.py_object, ctypes.py_object, ctypes.py_object)
+            create_func = CreateFT(create_fn)
+            self._keepalive.extend([CreateFT, create_func])
+            module = create_func(spec, moduledef)
             if module is None:
                 raise RuntimeError("Py_mod_create вернул NULL")
-            self._log(f"Py_mod_create OK → {type(module)}")
+            self._log("Py_mod_create выполнен → получен модуль")
         else:
-            addr_new = _find_python_dll_proc(b"PyModule_NewObject")
-            if addr_new:
-                _FT = ctypes.PYFUNCTYPE(ctypes.py_object, ctypes.py_object)
-                _fn = _FT(addr_new)
-                self._keepalive.extend([_FT, _fn])
-                module = _fn(register_name)
-                if module is None:
-                    raise RuntimeError("PyModule_NewObject вернул NULL")
-                self._log("PyModule_NewObject OK")
-            else:
-                module = types.ModuleType(register_name)
-                self._log("Fallback types.ModuleType")
+            # fallback — просто пустой модуль
+            module = types.ModuleType(register_name)
+            self._log("Py_mod_create отсутствует → fallback types.ModuleType")
 
-        _ExecFT = ctypes.PYFUNCTYPE(ctypes.c_int, ctypes.py_object)
-        self._keepalive.append(_ExecFT)
+        # 2. Выполняем ВСЕ Py_mod_exec слоты (если они есть)
+        ExecFT = ctypes.PYFUNCTYPE(ctypes.c_int, ctypes.py_object)
+        self._keepalive.append(ExecFT)
         for i, fn_addr in enumerate(exec_fns):
-            _efn = _ExecFT(fn_addr)
-            self._keepalive.append(_efn)
-            rc = _efn(module)
+            exec_func = ExecFT(fn_addr)
+            self._keepalive.append(exec_func)
+            rc = exec_func(module)
             if rc != 0:
-                raise RuntimeError(f"Py_mod_exec[{i}] @ {hex(fn_addr)} вернул {rc}")
-            self._log(f"Py_mod_exec[{i}] OK")
+                raise RuntimeError(f"Py_mod_exec[{i}] вернул ошибку {rc} (addr={hex(fn_addr)})")
+            self._log(f"Py_mod_exec[{i}] выполнен успешно")
 
-        if not exec_fns and addr_exec:
-            _FT2 = ctypes.PYFUNCTYPE(ctypes.c_int, ctypes.py_object, ctypes.py_object)
-            _fn2 = _FT2(addr_exec)
-            self._keepalive.extend([_FT2, _fn2])
-            rc = _fn2(module, moduledef)
-            if rc != 0:
-                raise RuntimeError(f"PyModule_ExecDef вернул {rc}")
-            self._log("PyModule_ExecDef OK")
+        # Больше ничего не делаем — если модуль не имеет exec-слотов, то он уже готов
 
         try:
-            module.__pyd_keepalive__ = self._keepalive
+            module.__pyd_keepalive__ = self._keepalive  # защита от GC
         except Exception:
             pass
 
         return module
 
 
-# ── Загрузчик пакета из нескольких .pyd ──────────────────────────────────────
+# ── PydPackageLoader (без изменений, только для полноты) ──────────────────────
 
 class PydPackageLoader:
     """
@@ -892,7 +854,6 @@ class PydPackageLoader:
         import atom
         atom.parse_pattern("...")
     """
-
     def __init__(
         self,
         package_name: str,
@@ -908,22 +869,12 @@ class PydPackageLoader:
         self._package_name  = package_name
         self._suppress_debug = suppress_debug
         self._verbose        = verbose
-
-        # { submodule_name: bytes }  — в порядке добавления
         self._entries: list[tuple[str, bytes]] = []
         self._loaders: dict[str, PydMemoryLoader] = {}
         self._package_module: Optional[types.ModuleType] = None
 
-    # ── Фабричные методы ─────────────────────────────────────────────────────
-
     @classmethod
-    def from_dir(
-        cls,
-        package_name: str,
-        directory: str,
-        pattern: str = "*.pyd",
-        **kwargs,
-    ) -> "PydPackageLoader":
+    def from_dir(cls, package_name: str, directory: str, pattern: str = "*.pyd", **kwargs):
         """
         Создаёт загрузчик из директории с .pyd файлами.
 
@@ -936,19 +887,14 @@ class PydPackageLoader:
         pkg = cls(package_name, **kwargs)
         files = sorted(glob.glob(os.path.join(directory, pattern)))
         if not files:
-            raise FileNotFoundError(
-                f"Не найдено .pyd файлов по паттерну {pattern!r} в {directory!r}"
-            )
+            raise FileNotFoundError(f"Нет .pyd файлов в {directory!r} по маске {pattern!r}")
         for path in files:
             with open(path, "rb") as f:
                 data = f.read()
-            # Имя модуля из имени файла: "parser.cp312-win_amd64.pyd" → "parser"
-            basename    = os.path.basename(path)
-            module_base = basename.split(".")[0]  # "parser"
-            pkg.add(module_base, data)
+            basename = os.path.basename(path)
+            mod_base = basename.split(".")[0]
+            pkg.add(mod_base, data)
         return pkg
-
-    # ── Публичный API ─────────────────────────────────────────────────────────
 
     def add(self, module_name: str, data: bytes) -> "PydPackageLoader":
         """
@@ -964,6 +910,7 @@ class PydPackageLoader:
         """
         self._entries.append((module_name, data))
         return self
+
 
     def add_file(self, path: str, module_name: Optional[str] = None) -> "PydPackageLoader":
         """Добавляет .pyd файл из пути на диске."""
@@ -982,7 +929,7 @@ class PydPackageLoader:
             return self._package_module
 
         pkg = self._package_name
-        self._log(f"Загружаем пакет '{pkg}' ({len(self._entries)} файлов)...")
+        self._log(f"Загрузка пакета '{pkg}' ({len(self._entries)} файлов)...")
 
         # ── Шаг 1: регистрируем пакет с виртуальным __path__ ─────────────
         # __path__ должен быть непустым списком чтобы Python разрешал
@@ -990,19 +937,19 @@ class PydPackageLoader:
         if pkg not in sys.modules:
             pkg_mod = types.ModuleType(pkg)
             pkg_mod.__package__ = pkg
-            pkg_mod.__path__    = [f"<memory>/{pkg}"]  # виртуальный путь
+            pkg_mod.__path__    = [f"<memory>/{pkg}"]
             pkg_mod.__spec__    = importlib.machinery.ModuleSpec(
                 pkg, loader=None, origin=f"<memory>/{pkg}/__init__"
             )
             pkg_mod.__spec__.submodule_search_locations = pkg_mod.__path__
             sys.modules[pkg] = pkg_mod
-            self._log(f"Пакет '{pkg}' зарегистрирован в sys.modules")
+            self._log(f"Пакет '{pkg}' зарегистрирован")
         else:
             pkg_mod = sys.modules[pkg]
             # Убеждаемся что __path__ установлен
             if not getattr(pkg_mod, "__path__", None):
                 pkg_mod.__path__ = [f"<memory>/{pkg}"]
-            self._log(f"Пакет '{pkg}' уже в sys.modules")
+            self._log(f"Пакет '{pkg}' уже существует")
 
         # ── Шаг 2: устанавливаем перехватчик для relative imports ────────
         # Когда __init__.pyd делает "from .parser import X", Python ищет
@@ -1010,75 +957,56 @@ class PydPackageLoader:
         # который перенаправит этот поиск на наши загруженные модули.
         # ── Шаг 3: загружаем субмодули (всё кроме __init__) ────────────
         init_entry = None
-        for module_name, data in self._entries:
-            if module_name == "__init__":
-                init_entry = (module_name, data)
+        for mod_name, data in self._entries:
+            if mod_name == "__init__":
+                init_entry = (mod_name, data)
                 continue
-            full_name = f"{pkg}.{module_name}"
-            self._log(f"  Загружаем субмодуль '{full_name}'...")
-            sub_loader = PydMemoryLoader(
+            full_name = f"{pkg}.{mod_name}"
+            self._log(f"  → субмодуль {full_name}")
+            loader = PydMemoryLoader(
                 data,
-                module_name       = full_name,
-                suppress_debug    = self._suppress_debug,
-                verbose           = self._verbose,
+                module_name=full_name,
+                suppress_debug=self._suppress_debug,
+                verbose=self._verbose,
             )
-            sub_mod = sub_loader.load()
-            self._loaders[full_name] = sub_loader
-            setattr(pkg_mod, module_name, sub_mod)
-            self._log(f"  '{full_name}' загружен OK")
+            sub_mod = loader.load()
+            self._loaders[full_name] = loader
+            setattr(pkg_mod, mod_name, sub_mod)
 
         # ── Шаг 4: загружаем __init__ последним ──────────────────────────
         # Finder устанавливается непосредственно перед exec-фазой __init__,
         # чтобы перехватывать relative imports именно во время их выполнения.
         if init_entry:
-            module_name, data = init_entry
-            self._log(f"  Загружаем '{pkg}.__init__'...")
-
-            # Убеждаемся что pkg_mod в sys.modules имеет корректный __spec__
-            # с submodule_search_locations — без этого relative import падает
-            # с "attempted relative import with no known parent package"
-            pkg_mod.__spec__ = importlib.machinery.ModuleSpec(pkg, loader=None)
-            pkg_mod.__spec__.submodule_search_locations = list(pkg_mod.__path__)
-            pkg_mod.__package__ = pkg
-            sys.modules[pkg] = pkg_mod  # обновляем на случай если был заменён
-
-            # Finder перехватывает "atom.parser" → уже загруженный модуль
+            self._log(f"  → __init__ пакета {pkg}")
+            _, data = init_entry
             finder = _MemoryPackageFinder(pkg, self._loaders)
             sys.meta_path.insert(0, finder)
             try:
                 init_loader = PydMemoryLoader(
                     data,
-                    module_name             = pkg,
-                    suppress_debug          = self._suppress_debug,
-                    verbose                 = self._verbose,
-                    register_in_sys_modules = False,
+                    module_name=pkg,
+                    suppress_debug=self._suppress_debug,
+                    verbose=self._verbose,
+                    register_in_sys_modules=False,
                 )
                 init_mod = init_loader.load()
+                self._loaders[pkg] = init_loader
+                # Переносим атрибуты из __init__ в пакет
+                for k, v in vars(init_mod).items():
+                    if not k.startswith("__") or k in ("__all__", "__version__"):
+                        setattr(pkg_mod, k, v)
             finally:
-                if finder in sys.meta_path:
-                    sys.meta_path.remove(finder)
-
-            self._loaders[pkg] = init_loader
-
-            # Копируем публичные атрибуты из __init__ в pkg_mod
-            for attr_name, attr_val in vars(init_mod).items():
-                if not attr_name.startswith("__") or attr_name in (
-                    "__all__", "__version__", "__author__"
-                ):
-                    setattr(pkg_mod, attr_name, attr_val)
-
-            self._log(f"  '__init__' загружен, атрибуты скопированы в пакет")
-        else:
-            self._log(f"  __init__.pyd не найден, пакет = набор субмодулей")
+                sys.meta_path.remove(finder)
 
         self._package_module = pkg_mod
-        self._log(f"Пакет '{pkg}' полностью загружен.")
+        self._log(f"Пакет '{pkg}' полностью загружен")
         return pkg_mod
 
     @property
     def package(self) -> Optional[types.ModuleType]:
         """Загруженный пакет или None."""
         return self._package_module
+
 
     @property
     def submodules(self) -> dict[str, types.ModuleType]:
@@ -1198,7 +1126,7 @@ class _MemoryPackageFinder:
     """
 
     def __init__(self, package_name: str, loaders: dict):
-        self._pkg     = package_name
+        self._pkg = package_name
         self._loaders = loaders
 
     def find_spec(self, fullname, path, target=None):
@@ -1207,22 +1135,18 @@ class _MemoryPackageFinder:
             return None
         # Если уже загружен — возвращаем spec для него
         if fullname in sys.modules:
-            mod  = sys.modules[fullname]
+            mod = sys.modules[fullname]
             spec = importlib.machinery.ModuleSpec(
                 fullname,
-                loader  = _AlreadyLoadedLoader(mod),
-                origin  = getattr(mod, "__file__", f"<memory>/{fullname}"),
+                loader=_AlreadyLoadedLoader(mod),
+                origin=getattr(mod, "__file__", f"<memory>/{fullname}"),
             )
             return spec
-        return None
-
-    def find_module(self, fullname, path=None):
         return None
 
 
 class _AlreadyLoadedLoader:
     """Loader-заглушка для модулей уже загруженных в память."""
-
     def __init__(self, module):
         self._module = module
 
