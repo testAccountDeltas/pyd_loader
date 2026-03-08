@@ -34,15 +34,93 @@ from typing import Optional, Any
 
 if os.name != "nt":
     raise RuntimeError("PydMemoryLoader работает только на Windows (.pyd — это DLL)")
-    
+
+if sys.version_info < (3, 10):
+    raise RuntimeError(
+        f"pyd_loader требует Python 3.10+, "
+        f"текущая версия: {sys.version_info.major}.{sys.version_info.minor}"
+    )
+
 import pythonmemorymodule
 
 # ── Константы PyModuleDef ─────────────────────────────────────────────────────
 
-_Py_mod_create = 1
-_Py_mod_exec   = 2
-_OFF_M_SLOTS   = 72   # offset of m_slots in PyModuleDef (CPython 3.5+)
-_SLOT_SIZE     = 16   # sizeof(PyModuleDef_Slot) — type (int) + value (void*)
+class _PyModSlot:
+    CREATE               = 1   # Py_mod_create
+    EXEC                 = 2   # Py_mod_exec
+    MULTIPLE_INTERPRETERS = 3  # Py_mod_multiple_interpreters (3.12+)
+    GIL                  = 4   # Py_mod_gil                   (3.13+)
+    ABI                  = 5   # Py_mod_abi                   (3.15+)
+    NAME                 = 6   # Py_mod_name
+    DOC                  = 7   # Py_mod_doc
+    STATE_SIZE           = 8   # Py_mod_state_size
+    METHODS              = 9   # Py_mod_methods
+    STATE_TRAVERSE       = 10  # Py_mod_state_traverse
+    STATE_CLEAR          = 11  # Py_mod_state_clear
+    STATE_FREE           = 12  # Py_mod_state_free
+    TOKEN                = 13  # Py_mod_token
+
+
+# ── Структуры CPython (из moduleobject.h) ────────────────────────────────────
+#
+# PyObject_HEAD = ob_refcnt (Py_ssize_t, 8 bytes) + *ob_type (8 bytes) = 16 bytes
+#
+# PyModuleDef_Base:
+#   PyObject_HEAD   16 bytes
+#   m_init          8 bytes  (function pointer)
+#   m_index         8 bytes  (Py_ssize_t)
+#   m_copy          8 bytes  (PyObject*)
+#   total           40 bytes
+#
+# PyModuleDef:
+#   m_base          40 bytes
+#   m_name          8 bytes  (char*)
+#   m_doc           8 bytes  (char*)
+#   m_size          8 bytes  (Py_ssize_t)
+#   m_methods       8 bytes  (PyMethodDef*)
+#   m_slots         8 bytes  (PyModuleDef_Slot*)   ← offset 72
+#   m_traverse      8 bytes
+#   m_clear         8 bytes
+#   m_free          8 bytes
+#
+# PyModuleDef_Slot:
+#   slot            4 bytes  (int) + 4 bytes padding = 8 bytes aligned
+#   value           8 bytes  (void*)
+#   total           16 bytes
+
+class _PyObject_HEAD(ctypes.Structure):
+    _fields_ = [
+        ("ob_refcnt", ctypes.c_ssize_t),   # Py_ssize_t ob_refcnt
+        ("ob_type",   ctypes.c_void_p),    # PyTypeObject *ob_type
+    ]
+
+class _PyModuleDef_Base(ctypes.Structure):
+    _fields_ = [
+        ("ob_base", _PyObject_HEAD),        # PyObject_HEAD (16 bytes)
+        ("m_init",  ctypes.c_void_p),       # PyObject* (*m_init)(void)
+        ("m_index", ctypes.c_ssize_t),      # Py_ssize_t m_index
+        ("m_copy",  ctypes.c_void_p),       # PyObject* m_copy
+    ]
+
+class _PyModuleDef_Slot(ctypes.Structure):
+    _fields_ = [
+        ("slot",  ctypes.c_int),            # int slot  (4 bytes + 4 pad → 8 aligned)
+        ("_pad",  ctypes.c_int),            # explicit padding
+        ("value", ctypes.c_void_p),         # void *value
+    ]
+
+class _PyModuleDef(ctypes.Structure):
+    _fields_ = [
+        ("m_base",     _PyModuleDef_Base),                  # 40 bytes
+        ("m_name",     ctypes.c_char_p),                    # const char*
+        ("m_doc",      ctypes.c_char_p),                    # const char*
+        ("m_size",     ctypes.c_ssize_t),                   # Py_ssize_t
+        ("m_methods",  ctypes.c_void_p),                    # PyMethodDef*
+        ("m_slots",    ctypes.POINTER(_PyModuleDef_Slot)),  # PyModuleDef_Slot*
+        ("m_traverse", ctypes.c_void_p),                    # traverseproc
+        ("m_clear",    ctypes.c_void_p),                    # inquiry
+        ("m_free",     ctypes.c_void_p),                    # freefunc
+    ]
 
 # ── PE-уровень (определение имени модуля) ─────────────────────────────────────
 
@@ -100,27 +178,31 @@ def _get_dll_imports(data: bytes) -> dict[str, list[str]]:
 # ── Работа со слотами PyModuleDef ─────────────────────────────────────────────
 
 def _read_moduledef_slots(moduledef_obj) -> tuple[Optional[int], list[int]]:
-    """Читает слоты из PyModuleDef.m_slots по смещению."""
-    base = id(moduledef_obj)
-    slots_addr = ctypes.c_uint64.from_address(base + _OFF_M_SLOTS).value
-    if slots_addr == 0:
+    """
+    Читает слоты из PyModuleDef через ctypes-структуры.
+
+    id(obj) == адрес PyObject в памяти CPython — стандартная гарантия.
+    Приводим адрес к _PyModuleDef* и читаем m_slots напрямую.
+    """
+    moduledef = _PyModuleDef.from_address(id(moduledef_obj))
+
+    if not moduledef.m_slots:
         return None, []
-    
-    create_fn = None
-    exec_fns: list[int] = []
+
+    create_fn: Optional[int] = None
+    exec_fns:  list[int]     = []
+
     idx = 0
     while True:
-        s_type = ctypes.c_int.from_address(slots_addr + idx * _SLOT_SIZE).value
-        if s_type == 0:
+        slot = moduledef.m_slots[idx]
+        if slot.slot == 0:
             break
-        s_val = ctypes.c_uint64.from_address(slots_addr + idx * _SLOT_SIZE + 8).value
-        
-        if s_type == _Py_mod_create:
-            create_fn = s_val
-        elif s_type == _Py_mod_exec:
-            exec_fns.append(s_val)
-        
+        if slot.slot == _PyModSlot.CREATE:
+            create_fn = slot.value
+        elif slot.slot == _PyModSlot.EXEC:
+            exec_fns.append(slot.value)
         idx += 1
+
     return create_fn, exec_fns
 
 
