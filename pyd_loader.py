@@ -153,7 +153,7 @@ def _incref_all_c_objects(mod) -> None:
             pass
 
 
-# ── Классификация атрибутов (без изменений) ───────────────────────────────────
+# ── Классификация атрибутов ───────────────────────────────────
 
 def _classify_attr(obj: Any) -> str:
     if inspect.isbuiltin(obj):
@@ -829,7 +829,7 @@ class PydMemoryLoader:
         return module
 
 
-# ── PydPackageLoader (без изменений, только для полноты) ──────────────────────
+# ── PydPackageLoader  ──────────────────────
 
 class PydPackageLoader:
     """
